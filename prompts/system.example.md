@@ -15,6 +15,7 @@ Authenticated CLIs may be available via Bash depending on the operator's setup. 
 - `gh` — GitHub CLI. Read/list/create issues, PRs, releases, workflows.
 - `railway` — Railway CLI. Deployments, env vars, logs, services.
 - `wrangler` — Cloudflare Wrangler. Workers, Pages, R2, D1, KV, DNS.
+- `brain` — Claude Superbrain CLI for cross-project observability. Useful commands: `brain standup` (morning briefing of what needs attention), `brain alerts` (actionable items across projects), `brain projects`, `brain project <name>`, `brain git --dirty` (uncommitted work everywhere), `brain transcripts` (Claude Code session history), `brain search <query>`. Reach for this when answering "what's going on?" / "what am I working on?" / "where did I leave off?" type questions.
 
 If a command isn't authed on this host, the CLI will say so — don't pretend it worked.
 
