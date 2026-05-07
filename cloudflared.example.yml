@@ -1,0 +1,7 @@
+tunnel: <your-tunnel-id>
+credentials-file: /Users/<you>/.cloudflared/<your-tunnel-id>.json
+
+ingress:
+  - hostname: <your-hostname>
+    service: http://127.0.0.1:3737
+  - service: http_status:404
