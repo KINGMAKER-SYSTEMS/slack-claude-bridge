@@ -9,13 +9,13 @@ function requireToken() {
 
 export async function postReply(
   channel: string,
-  threadTs: string,
+  threadTs: string | null,
   text: string,
 ) {
   requireToken();
   await slack.chat.postMessage({
     channel,
-    thread_ts: threadTs,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
     text,
     mrkdwn: true,
   });

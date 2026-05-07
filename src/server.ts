@@ -2,9 +2,18 @@ import "dotenv/config";
 import Fastify from "fastify";
 import { verifySlackSignature } from "./verify.js";
 import { fetchChannel, fetchThread, postReply } from "./slack.js";
-import { getSession, setSession, threadKey } from "./sessions.js";
+import { threadKey } from "./sessions.js";
 import { runClaude } from "./spawn.js";
+import {
+  buildPrompt,
+  loadContext,
+  pickRecentSinceSummary,
+  saveContext,
+  shouldSquash,
+  squash,
+} from "./context.js";
 import { log } from "./log.js";
+import { getDashboardData, renderDashboardHtml } from "./dashboard.js";
 
 const PORT = Number(process.env.PORT || 3737);
 const BOT_USER_ID = process.env.SLACK_BOT_USER_ID || "";
@@ -30,6 +39,34 @@ app.addContentTypeParser(
 );
 
 app.get("/health", async () => ({ ok: true }));
+
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
+
+function checkDashboardAuth(req: any): boolean {
+  if (!DASHBOARD_TOKEN) {
+    const ip = (req.headers["x-forwarded-for"] || req.ip || "").toString();
+    return ip === "127.0.0.1" || ip === "::1" || ip.startsWith("127.");
+  }
+  const provided =
+    req.query?.token ||
+    (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
+  return provided === DASHBOARD_TOKEN;
+}
+
+app.get("/dashboard", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).type("text/plain").send("unauthorized");
+  }
+  const data = await getDashboardData();
+  reply.type("text/html").send(renderDashboardHtml(data));
+});
+
+app.get("/dashboard.json", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  return await getDashboardData();
+});
 
 const inFlight = new Set<string>();
 
@@ -83,41 +120,87 @@ app.post("/slack/events", async (req, reply) => {
   inFlight.add(key);
 
   try {
-    const messages = inThread
+    const rawMessages = inThread
       ? await fetchThread(channel, threadTs)
       : await fetchChannel(channel, 100);
-    const transcript = messages
-      .map((m: any) => {
-        const who = m.bot_id ? `bot:${m.bot_id}` : `user:${m.user}`;
-        return `[${who}] ${m.text || ""}`;
-      })
-      .join("\n\n");
+    const messages = (rawMessages as any[])
+      .filter((m) => typeof m.ts === "string")
+      .map((m) => ({
+        ts: m.ts as string,
+        user: m.user,
+        bot_id: m.bot_id,
+        text: m.text,
+      }));
+
+    const ctx = await loadContext(key);
+    const recent = pickRecentSinceSummary(messages, ctx.summarizedThrough);
+    const newSinceLastSquash = ctx.summarizedThrough
+      ? messages.filter((m) => Number(m.ts) > Number(ctx.summarizedThrough!))
+          .length
+      : messages.length;
 
     const latestText: string = event.text || "";
     const scopeLabel = inThread ? "Slack thread" : "Slack channel";
-    const transcriptLabel = inThread
-      ? "Thread transcript (oldest first):"
-      : "Recent channel messages (oldest first, last 100):";
-    const prompt = `You are responding inside a ${scopeLabel}.
+    const prompt = buildPrompt({
+      scopeLabel,
+      summary: ctx.summary,
+      recent,
+      latestText,
+      botUserId: BOT_USER_ID,
+    });
 
-${transcriptLabel}
----
-${transcript}
----
-
-Latest message that mentioned you:
-${latestText}
-
-Write the reply text only. Plain Slack markdown. No preamble, no "here is your reply" framing — just the message body that should be posted.`;
-
-    const existing = await getSession(key);
-    await log({ kind: "spawn", key, resume: !!existing });
-    const result = await runClaude(prompt, existing);
-    if (result.sessionId) await setSession(key, result.sessionId);
+    await log({
+      kind: "spawn",
+      key,
+      summaryChars: ctx.summary.length,
+      recentMsgs: recent.length,
+    });
+    const result = await runClaude(prompt);
 
     const text = result.text || "(no response)";
-    await postReply(channel, threadTs, text);
-    await log({ kind: "replied", key, chars: text.length });
+    await postReply(channel, inThread ? threadTs : null, text);
+    await log({ kind: "replied", key, chars: text.length, inThread });
+
+    ctx.msgsSinceSquash = newSinceLastSquash;
+    if (shouldSquash(ctx)) {
+      const cutoff = ctx.summarizedThrough;
+      const toFold = messages
+        .filter((m) => !cutoff || Number(m.ts) > Number(cutoff))
+        .sort((a, b) => Number(a.ts) - Number(b.ts));
+      try {
+        const newSummary = await squash({
+          priorSummary: ctx.summary,
+          messagesToFold: toFold,
+          botUserId: BOT_USER_ID,
+        });
+        ctx.summary = newSummary;
+        ctx.summarizedThrough =
+          toFold[toFold.length - 1]?.ts || ctx.summarizedThrough;
+        ctx.msgsSinceSquash = 0;
+        await log({
+          kind: "squashed",
+          key,
+          summaryChars: newSummary.length,
+          foldedMsgs: toFold.length,
+        });
+      } catch (err) {
+        await log({
+          kind: "squash_failed",
+          key,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    ctx.updatedAt = Date.now();
+    try {
+      await saveContext(key, ctx);
+    } catch (err) {
+      await log({
+        kind: "context_save_failed",
+        key,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   } catch (err) {
     await log({
       kind: "error",
@@ -127,7 +210,7 @@ Write the reply text only. Plain Slack markdown. No preamble, no "here is your r
     try {
       await postReply(
         channel,
-        threadTs,
+        inThread ? threadTs : null,
         `_(bridge error — check logs)_`,
       );
     } catch {}

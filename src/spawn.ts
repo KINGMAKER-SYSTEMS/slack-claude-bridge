@@ -23,10 +23,7 @@ function loadSystemPrompt(): string {
 
 const SYSTEM_PROMPT = loadSystemPrompt();
 
-export async function runClaude(
-  prompt: string,
-  resumeSessionId: string | null,
-): Promise<ClaudeResult> {
+export async function runClaude(prompt: string): Promise<ClaudeResult> {
   return new Promise((resolve, reject) => {
     const args = [
       "-p",
@@ -36,11 +33,8 @@ export async function runClaude(
       "--include-partial-messages",
       "--append-system-prompt",
       SYSTEM_PROMPT,
+      prompt,
     ];
-    if (resumeSessionId) {
-      args.push("--resume", resumeSessionId);
-    }
-    args.push(prompt);
 
     const child = spawn("claude", args, {
       stdio: ["ignore", "pipe", "pipe"],
