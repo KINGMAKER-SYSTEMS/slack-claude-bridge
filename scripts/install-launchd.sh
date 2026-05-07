@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLIST_NAME="com.risingtides.slack-claude-bridge"
+# Configurable via env. Defaults to a generic label.
+PLIST_NAME="${BRIDGE_PLIST_NAME:-com.slack-claude-bridge}"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
-PROJECT_DIR="$HOME/dev/slack-claude-bridge"
-NODE_BIN="$(command -v node)"
-PNPM_BIN="$(command -v pnpm)"
+PROJECT_DIR="${BRIDGE_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+NODE_BIN="$(command -v node || true)"
+PNPM_BIN="$(command -v pnpm || true)"
 
 if [[ -z "${NODE_BIN}" || -z "${PNPM_BIN}" ]]; then
   echo "node and pnpm must be on PATH" >&2

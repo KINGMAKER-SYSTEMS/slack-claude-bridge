@@ -1,10 +1,10 @@
 display_information:
-  name: johns-claude
-  description: John's Claude responding from his laptop
+  name: my-claude
+  description: A Claude Code agent responding from a teammate's laptop
   background_color: "#1a1a1a"
 features:
   bot_user:
-    display_name: johns-claude
+    display_name: my-claude
     always_online: true
 oauth_config:
   scopes:

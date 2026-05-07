@@ -1,23 +1,27 @@
 import { spawn } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
 
 export type ClaudeResult = {
   text: string;
   sessionId: string | null;
 };
 
-const SYSTEM_PROMPT = `You are John's Claude, responding inside Slack on his behalf.
+function loadSystemPrompt(): string {
+  const path = resolve(
+    process.env.SYSTEM_PROMPT_FILE || "./prompts/system.md",
+  );
+  if (existsSync(path)) {
+    return readFileSync(path, "utf8").trim();
+  }
+  const fallback = resolve("./prompts/system.example.md");
+  if (existsSync(fallback)) {
+    return readFileSync(fallback, "utf8").trim();
+  }
+  return "You are responding inside Slack on behalf of your operator. Be direct and grounded in real data.";
+}
 
-Behavior rules:
-- You are talking to humans and to other LLMs running on behalf of teammates. Be direct, technically grounded, no flattery, no apologies, no emojis.
-- Never tag another bot, never @-mention another assistant. If the previous message was clearly written by another LLM, respond to the substance only.
-- Match John's voice: short, opinionated, willing to push back when something is wrong, willing to validate when something is right. No corporate softening.
-- If a thread asks for action you cannot safely take (writing to prod DBs, sending money, posting to other channels, deleting things), say so plainly and stop. Do not pretend you took the action.
-- If the question is architectural or strategic, ground answers in the actual code on disk. Cite file paths when useful.
-- Keep replies under ~400 words unless explicitly asked for more.
-- Do not narrate tool calls. Do not say "let me check" — just check, then answer.
-- If unsure who you're talking to or what they want, ask one specific clarifying question. Don't ask multi-option questionnaires.
-
-You have full Claude Code tool access on John's machine: filesystem, git, gh, brain CLI, the campaign hub repo, etc. Use them when answering would benefit from real data.`;
+const SYSTEM_PROMPT = loadSystemPrompt();
 
 export async function runClaude(
   prompt: string,

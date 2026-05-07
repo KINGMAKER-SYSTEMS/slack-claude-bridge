@@ -6,3 +6,4 @@ data/
 .DS_Store
 cloudflared.yml
 .claude/settings.local.json
+prompts/system.md

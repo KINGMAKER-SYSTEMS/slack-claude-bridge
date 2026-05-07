@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLIST_NAME="com.risingtides.slack-claude-bridge"
+PLIST_NAME="${BRIDGE_PLIST_NAME:-com.slack-claude-bridge}"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 
 if [[ -f "${PLIST_PATH}" ]]; then
