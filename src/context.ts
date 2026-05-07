@@ -187,7 +187,19 @@ Drop pleasantries, off-topic asides, redundant restatements. Replace the prior s
         reject(new Error(`squash claude exited ${code}: ${stderr.slice(0, 300)}`));
         return;
       }
-      resolve(result.trim() || priorSummary);
+      const trimmed = result.trim();
+      if (!trimmed) {
+        // Claude exited cleanly but produced no summary text. Surface this
+        // as an error so the caller can log it properly instead of silently
+        // overwriting a real prior summary with an empty string.
+        reject(
+          new Error(
+            `squash produced empty summary (code=${code}, stderr=${stderr.slice(0, 200)})`,
+          ),
+        );
+        return;
+      }
+      resolve(trimmed);
     });
   });
 }

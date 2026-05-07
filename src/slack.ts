@@ -13,12 +13,54 @@ export async function postReply(
   text: string,
 ) {
   requireToken();
-  await slack.chat.postMessage({
+  const res = await slack.chat.postMessage({
     channel,
     ...(threadTs ? { thread_ts: threadTs } : {}),
     text,
     mrkdwn: true,
   });
+  return res.ts as string | undefined;
+}
+
+export async function updateMessage(
+  channel: string,
+  ts: string,
+  text: string,
+) {
+  requireToken();
+  await slack.chat.update({
+    channel,
+    ts,
+    text,
+  });
+}
+
+export async function addReaction(
+  channel: string,
+  ts: string,
+  name: string,
+) {
+  requireToken();
+  try {
+    await slack.reactions.add({ channel, timestamp: ts, name });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("already_reacted")) throw err;
+  }
+}
+
+export async function removeReaction(
+  channel: string,
+  ts: string,
+  name: string,
+) {
+  requireToken();
+  try {
+    await slack.reactions.remove({ channel, timestamp: ts, name });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("no_reaction")) throw err;
+  }
 }
 
 export async function fetchThread(channel: string, threadTs: string) {
