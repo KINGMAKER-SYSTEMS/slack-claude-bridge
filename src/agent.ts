@@ -1,0 +1,355 @@
+import { z } from "zod";
+import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  fetchChannel,
+  fetchThread,
+  postReply,
+  slack,
+} from "./slack.js";
+
+function loadSystemPrompt(): string {
+  const path = resolve(
+    process.env.SYSTEM_PROMPT_FILE || "./prompts/system.md",
+  );
+  if (existsSync(path)) {
+    return readFileSync(path, "utf8").trim();
+  }
+  const fallback = resolve("./prompts/system.example.md");
+  if (existsSync(fallback)) {
+    return readFileSync(fallback, "utf8").trim();
+  }
+  return "You are a helpful agent.";
+}
+
+const PORTAL_PROMPT_SUFFIX = `
+
+You are running inside the operator's Portal — a private web chat where they steer you. You have Slack tools to read channels, read threads, and post messages on behalf of the bot account.
+
+Portal behavior:
+- The operator may ask you to do things in Slack ("read #campaigns", "draft a reply for that thread", "post this in #eng").
+- Always confirm before posting to Slack. Show the exact text you intend to post and the channel, then wait for an explicit "yes / send / go". Never post unprompted.
+- When the operator asks for information from Slack, just go fetch it with your tools. Don't narrate ("let me check") — just call the tool, then summarize the result.
+- The operator's Slack user ID and the bot's Slack user ID are passed in your environment. Never tag the bot user.
+- If the operator says something ambiguous, ask one short clarifying question.
+
+Tools available:
+- slack_search_channels: list/search channels by name
+- slack_read_channel: read recent messages from a channel
+- slack_read_thread: read a thread's messages
+- slack_post_message: post a message to a channel or thread (always requires operator confirmation first)
+`;
+
+function buildSlackTools() {
+  const slackReadChannel = tool(
+    "slack_read_channel",
+    "Read the most recent messages from a Slack channel. Returns oldest-first.",
+    {
+      channel: z
+        .string()
+        .describe("Slack channel ID (e.g. C0XXXXXXX) or name without the #"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("How many recent messages to fetch. Default 50, max 200."),
+    },
+    async ({ channel, limit }) => {
+      const channelId = await resolveChannelId(channel);
+      const messages = await fetchChannel(channelId, limit ?? 50);
+      const text = messages
+        .map((m: any) => {
+          const who = m.bot_id ? `bot:${m.bot_id}` : `user:${m.user || "?"}`;
+          const time = m.ts
+            ? new Date(Number(m.ts) * 1000).toISOString()
+            : "?";
+          return `[${time}] [${who}] ${m.text || ""}`;
+        })
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              text ||
+              `(channel ${channelId} has no readable messages, or the bot isn't a member)`,
+          },
+        ],
+      };
+    },
+  );
+
+  const slackReadThread = tool(
+    "slack_read_thread",
+    "Read all messages in a Slack thread.",
+    {
+      channel: z.string().describe("Slack channel ID"),
+      thread_ts: z
+        .string()
+        .describe("Slack thread timestamp (the parent message ts)"),
+    },
+    async ({ channel, thread_ts }) => {
+      const channelId = await resolveChannelId(channel);
+      const messages = await fetchThread(channelId, thread_ts);
+      const text = messages
+        .map((m: any) => {
+          const who = m.bot_id ? `bot:${m.bot_id}` : `user:${m.user || "?"}`;
+          const time = m.ts
+            ? new Date(Number(m.ts) * 1000).toISOString()
+            : "?";
+          return `[${time}] [${who}] ${m.text || ""}`;
+        })
+        .join("\n");
+      return {
+        content: [
+          { type: "text", text: text || "(thread has no messages)" },
+        ],
+      };
+    },
+  );
+
+  const slackPostMessage = tool(
+    "slack_post_message",
+    "Post a message to a Slack channel or thread as the bot. ONLY call this after the operator has explicitly confirmed (yes / send / go). The operator must see the exact text and channel first.",
+    {
+      channel: z
+        .string()
+        .describe("Slack channel ID or name without the #"),
+      text: z.string().describe("Message body to post. Plain Slack markdown."),
+      thread_ts: z
+        .string()
+        .optional()
+        .describe("Optional thread ts to reply inside an existing thread"),
+    },
+    async ({ channel, text, thread_ts }) => {
+      const channelId = await resolveChannelId(channel);
+      const ts = await postReply(channelId, thread_ts ?? null, text);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Posted to ${channelId}${
+              thread_ts ? ` (thread ${thread_ts})` : ""
+            }. Message ts: ${ts || "unknown"}.`,
+          },
+        ],
+      };
+    },
+  );
+
+  const slackSearchChannels = tool(
+    "slack_search_channels",
+    "List Slack channels the bot is a member of. Optionally filter by a name substring.",
+    {
+      name_contains: z
+        .string()
+        .optional()
+        .describe("Filter by name substring (case-insensitive)"),
+    },
+    async ({ name_contains }) => {
+      const channels = await listBotChannels();
+      const filtered = name_contains
+        ? channels.filter((c) =>
+            c.name.toLowerCase().includes(name_contains.toLowerCase()),
+          )
+        : channels;
+      const text = filtered
+        .map((c) => `${c.id}  #${c.name}${c.is_private ? "  (private)" : ""}`)
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              text ||
+              "(bot is not a member of any channels, or filter matched nothing)",
+          },
+        ],
+      };
+    },
+  );
+
+  return [
+    slackReadChannel,
+    slackReadThread,
+    slackPostMessage,
+    slackSearchChannels,
+  ];
+}
+
+async function resolveChannelId(input: string): Promise<string> {
+  if (/^[CGD][A-Z0-9]+$/.test(input)) return input;
+  const stripped = input.replace(/^#/, "");
+  const channels = await listBotChannels();
+  const match = channels.find(
+    (c) => c.name.toLowerCase() === stripped.toLowerCase(),
+  );
+  if (match) return match.id;
+  return input;
+}
+
+let channelCache: { at: number; data: { id: string; name: string; is_private: boolean }[] } = {
+  at: 0,
+  data: [],
+};
+
+async function listBotChannels() {
+  const now = Date.now();
+  if (channelCache.data.length && now - channelCache.at < 60_000) {
+    return channelCache.data;
+  }
+  const result: { id: string; name: string; is_private: boolean }[] = [];
+  let cursor: string | undefined;
+  do {
+    const res: any = await slack.conversations.list({
+      limit: 200,
+      types: "public_channel,private_channel,mpim,im",
+      exclude_archived: true,
+      cursor,
+    });
+    for (const c of res.channels || []) {
+      if (c.is_member && c.id && c.name) {
+        result.push({
+          id: c.id,
+          name: c.name,
+          is_private: !!c.is_private,
+        });
+      }
+    }
+    cursor = res.response_metadata?.next_cursor;
+  } while (cursor);
+  channelCache = { at: now, data: result };
+  return result;
+}
+
+export type AgentTurnInput = {
+  prompt: string;
+  resumeSessionId?: string | null;
+  abortSignal?: AbortSignal;
+  /** One-shot situational brief injected into the system prompt for fresh sessions. */
+  landingBrief?: string;
+  onAssistantText?: (chunk: string) => void;
+  onToolUse?: (info: { name: string; input: any }) => void;
+  onToolResult?: (info: { name: string; isError?: boolean }) => void;
+};
+
+export type AgentTurnResult = {
+  text: string;
+  sessionId: string | null;
+  totalTokens?: number;
+  isError: boolean;
+};
+
+const BASE_SYSTEM_PROMPT = loadSystemPrompt();
+
+function buildSystemPrompt(opts?: { landingBrief?: string }): string {
+  const liveTools = ALLOWED_TOOLS.map((t) => `- ${t}`).join("\n");
+  const liveSection = `\n\nLive tools available this session (authoritative — trust this list, not memory):\n${liveTools}`;
+  const landing = opts?.landingBrief
+    ? `\n\nSession landing brief (current state at session start):\n${opts.landingBrief}`
+    : "";
+  return BASE_SYSTEM_PROMPT + PORTAL_PROMPT_SUFFIX + liveSection + landing;
+}
+
+const slackMcp = createSdkMcpServer({
+  name: "slack",
+  version: "0.1.0",
+  tools: buildSlackTools(),
+});
+
+const ALLOWED_TOOLS = [
+  "mcp__slack__slack_read_channel",
+  "mcp__slack__slack_read_thread",
+  "mcp__slack__slack_post_message",
+  "mcp__slack__slack_search_channels",
+  "Bash",
+  "Read",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
+];
+
+export async function runAgentTurn(
+  input: AgentTurnInput,
+): Promise<AgentTurnResult> {
+  let assistantText = "";
+  let sessionId: string | null = input.resumeSessionId ?? null;
+  let totalTokens: number | undefined;
+  let isError = false;
+
+  const queryResult = query({
+    prompt: input.prompt,
+    options: {
+      cwd: process.cwd(),
+      systemPrompt: buildSystemPrompt({ landingBrief: input.landingBrief }),
+      mcpServers: { slack: slackMcp },
+      allowedTools: ALLOWED_TOOLS,
+      tools: ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch"],
+      resume: input.resumeSessionId ?? undefined,
+      abortController: input.abortSignal
+        ? wrapSignal(input.abortSignal)
+        : undefined,
+    },
+  });
+
+  for await (const message of queryResult) {
+    if (message.type === "system" && (message as any).session_id) {
+      if (!sessionId) sessionId = (message as any).session_id;
+    }
+    if (message.type === "assistant") {
+      const content = (message as any).message?.content || [];
+      for (const block of content) {
+        if (block.type === "text" && block.text) {
+          assistantText += block.text;
+          input.onAssistantText?.(block.text);
+        }
+        if (block.type === "tool_use") {
+          input.onToolUse?.({ name: block.name, input: block.input });
+        }
+      }
+    }
+    if (message.type === "user") {
+      const content = (message as any).message?.content || [];
+      for (const block of content) {
+        if (block.type === "tool_result") {
+          input.onToolResult?.({
+            name: block.name || "",
+            isError: !!block.is_error,
+          });
+        }
+      }
+    }
+    if (message.type === "result") {
+      const r: any = message;
+      if (r.session_id && !sessionId) sessionId = r.session_id;
+      if (r.usage) {
+        totalTokens =
+          (r.usage.input_tokens || 0) + (r.usage.output_tokens || 0);
+      }
+      if (r.subtype && r.subtype !== "success") {
+        isError = true;
+      }
+      if (typeof r.result === "string" && r.result.length > assistantText.length) {
+        assistantText = r.result;
+      }
+    }
+  }
+
+  return {
+    text: assistantText.trim(),
+    sessionId,
+    totalTokens,
+    isError,
+  };
+}
+
+function wrapSignal(signal: AbortSignal): AbortController {
+  const ctrl = new AbortController();
+  if (signal.aborted) ctrl.abort();
+  signal.addEventListener("abort", () => ctrl.abort());
+  return ctrl;
+}

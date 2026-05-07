@@ -1,7 +1,14 @@
 import "dotenv/config";
 import Fastify from "fastify";
 import { verifySlackSignature } from "./verify.js";
-import { fetchChannel, fetchThread, postReply } from "./slack.js";
+import {
+  addReaction,
+  fetchChannel,
+  fetchThread,
+  postReply,
+  removeReaction,
+  updateMessage,
+} from "./slack.js";
 import { threadKey } from "./sessions.js";
 import { runClaude } from "./spawn.js";
 import {
@@ -13,7 +20,17 @@ import {
   squash,
 } from "./context.js";
 import { log } from "./log.js";
-import { getDashboardData, renderDashboardHtml } from "./dashboard.js";
+import { getDashboardData, renderAppHtml } from "./dashboard.js";
+import {
+  createPortal,
+  deletePortal,
+  listPortals,
+  loadPortal,
+  renamePortal,
+  resetPortal,
+  sendPortalMessage,
+} from "./portal.js";
+import { bus } from "./events.js";
 
 const PORT = Number(process.env.PORT || 3737);
 const BOT_USER_ID = process.env.SLACK_BOT_USER_ID || "";
@@ -53,12 +70,35 @@ function checkDashboardAuth(req: any): boolean {
   return provided === DASHBOARD_TOKEN;
 }
 
+// ---- App shell ----
+
+app.get("/", async (_req, reply) => {
+  reply.redirect("/app" + (DASHBOARD_TOKEN ? "?token=" + encodeURIComponent(DASHBOARD_TOKEN) : ""));
+});
+
+app.get("/app", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).type("text/plain").send("unauthorized");
+  }
+  const token = ((req.query as any)?.token as string) || DASHBOARD_TOKEN || "";
+  reply.type("text/html").send(renderAppHtml(token));
+});
+
+// Back-compat redirects so old bookmarks still work
 app.get("/dashboard", async (req, reply) => {
   if (!checkDashboardAuth(req)) {
     return reply.code(401).type("text/plain").send("unauthorized");
   }
-  const data = await getDashboardData();
-  reply.type("text/html").send(renderDashboardHtml(data));
+  const token = ((req.query as any)?.token as string) || DASHBOARD_TOKEN || "";
+  reply.redirect("/app" + (token ? "?token=" + encodeURIComponent(token) : ""));
+});
+
+app.get("/portal", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).type("text/plain").send("unauthorized");
+  }
+  const token = ((req.query as any)?.token as string) || DASHBOARD_TOKEN || "";
+  reply.redirect("/app" + (token ? "?token=" + encodeURIComponent(token) : ""));
 });
 
 app.get("/dashboard.json", async (req, reply) => {
@@ -68,7 +108,146 @@ app.get("/dashboard.json", async (req, reply) => {
   return await getDashboardData();
 });
 
+// ---- Portal data + actions ----
+
+app.get("/portal.json", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const id = ((req.query as any)?.id as string) || "main";
+  return await loadPortal(id);
+});
+
+app.get("/portal/list", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  return await listPortals();
+});
+
+app.post("/portal/message", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const body = req.body as { raw?: string; parsed?: any };
+  const parsed = body?.parsed ?? {};
+  const text = String(parsed.text || "").trim();
+  const id = String(parsed.id || "main");
+  if (!text) {
+    return reply.code(400).send({ error: "text required" });
+  }
+  try {
+    const result = await sendPortalMessage(text, id);
+    return result;
+  } catch (err) {
+    await log({
+      kind: "portal_error",
+      convoId: id,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return reply
+      .code(500)
+      .send({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post("/portal/create", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const body = req.body as { parsed?: any };
+  const title = body?.parsed?.title;
+  return await createPortal(title);
+});
+
+app.post("/portal/rename", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const body = req.body as { parsed?: any };
+  const id = String(body?.parsed?.id || "");
+  const title = String(body?.parsed?.title || "");
+  if (!id || !title) return reply.code(400).send({ error: "id and title required" });
+  return await renamePortal(id, title);
+});
+
+app.post("/portal/delete", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const body = req.body as { parsed?: any };
+  const id = String(body?.parsed?.id || "");
+  if (!id) return reply.code(400).send({ error: "id required" });
+  return await deletePortal(id);
+});
+
+app.post("/portal/reset", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  const body = req.body as { parsed?: any };
+  const id = String(body?.parsed?.id || "main");
+  return await resetPortal(id);
+});
+
+// ---- SSE live stream ----
+
+app.get("/stream", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  reply.raw.write(": connected\n\n");
+
+  const send = (event: any) => {
+    try {
+      reply.raw.write("data: " + JSON.stringify(event) + "\n\n");
+    } catch {}
+  };
+  const unsub = bus.subscribe(send);
+  const ping = setInterval(() => {
+    try {
+      reply.raw.write(": ping\n\n");
+    } catch {}
+  }, 25_000);
+
+  req.raw.on("close", () => {
+    clearInterval(ping);
+    unsub();
+    try {
+      reply.raw.end();
+    } catch {}
+  });
+});
+
+// ---- Slack events ----
+
 const inFlight = new Set<string>();
+
+// Dedup Slack event deliveries. Slack retries on missed/slow ACKs and may also
+// double-deliver. Drop anything we've already seen by event_id within a 5min window.
+const EVENT_DEDUP_TTL_MS = 5 * 60_000;
+const EVENT_DEDUP_MAX = 5000;
+const seenEventIds = new Map<string, number>();
+function pruneSeenEventIds() {
+  const cutoff = Date.now() - EVENT_DEDUP_TTL_MS;
+  for (const [id, ts] of seenEventIds) {
+    if (ts < cutoff) seenEventIds.delete(id);
+  }
+  if (seenEventIds.size > EVENT_DEDUP_MAX) {
+    const overflow = seenEventIds.size - EVENT_DEDUP_MAX;
+    let i = 0;
+    for (const id of seenEventIds.keys()) {
+      if (i++ >= overflow) break;
+      seenEventIds.delete(id);
+    }
+  }
+}
 
 app.post("/slack/events", async (req, reply) => {
   const headers = req.headers;
@@ -89,6 +268,30 @@ app.post("/slack/events", async (req, reply) => {
   }
 
   reply.send({ ok: true });
+
+  // If Slack is retrying, the first delivery either succeeded or is in flight
+  // and we don't want to process it again.
+  const retryNum = headers["x-slack-retry-num"];
+  if (retryNum) {
+    await log({
+      kind: "drop_retry",
+      retryNum: String(retryNum),
+      reason: String(headers["x-slack-retry-reason"] || ""),
+      eventId: payload.event_id,
+    });
+    return;
+  }
+
+  // Drop exact duplicate event deliveries.
+  const eventId: string | undefined = payload.event_id;
+  if (eventId) {
+    if (seenEventIds.has(eventId)) {
+      await log({ kind: "drop_duplicate", eventId });
+      return;
+    }
+    seenEventIds.set(eventId, Date.now());
+    pruneSeenEventIds();
+  }
 
   if (payload.type !== "event_callback") return;
   const event = payload.event;
@@ -118,6 +321,34 @@ app.post("/slack/events", async (req, reply) => {
     return;
   }
   inFlight.add(key);
+
+  const eventTs: string = event.ts;
+  let placeholderTs: string | undefined;
+  let reacted = false;
+  try {
+    await addReaction(channel, eventTs, "eyes");
+    reacted = true;
+  } catch (err) {
+    await log({
+      kind: "reaction_failed",
+      key,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
+    placeholderTs = await postReply(
+      channel,
+      inThread ? threadTs : null,
+      "_typing…_",
+    );
+  } catch (err) {
+    await log({
+      kind: "placeholder_failed",
+      key,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   try {
     const rawMessages = inThread
@@ -157,9 +388,47 @@ app.post("/slack/events", async (req, reply) => {
     });
     const result = await runClaude(prompt);
 
-    const text = result.text || "(no response)";
-    await postReply(channel, inThread ? threadTs : null, text);
-    await log({ kind: "replied", key, chars: text.length, inThread });
+    const text = result.text.trim();
+
+    if (!text) {
+      // Claude returned nothing usable. Don't pollute the channel with
+      // a "(no response)" placeholder — log it and stay silent. Clean up
+      // the placeholder message and reactions if we created them.
+      await log({ kind: "empty_response", key, inThread });
+      if (placeholderTs) {
+        try {
+          await updateMessage(
+            channel,
+            placeholderTs,
+            "_(no reply — see bridge logs)_",
+          );
+        } catch {}
+      }
+      if (reacted) {
+        try {
+          await removeReaction(channel, eventTs, "eyes");
+        } catch {}
+        try {
+          await addReaction(channel, eventTs, "warning");
+        } catch {}
+      }
+    } else {
+      if (placeholderTs) {
+        await updateMessage(channel, placeholderTs, text);
+      } else {
+        await postReply(channel, inThread ? threadTs : null, text);
+      }
+      await log({ kind: "replied", key, chars: text.length, inThread });
+
+      if (reacted) {
+        try {
+          await removeReaction(channel, eventTs, "eyes");
+        } catch {}
+        try {
+          await addReaction(channel, eventTs, "white_check_mark");
+        } catch {}
+      }
+    }
 
     ctx.msgsSinceSquash = newSinceLastSquash;
     if (shouldSquash(ctx)) {
@@ -208,12 +477,28 @@ app.post("/slack/events", async (req, reply) => {
       message: err instanceof Error ? err.message : String(err),
     });
     try {
-      await postReply(
-        channel,
-        inThread ? threadTs : null,
-        `_(bridge error — check logs)_`,
-      );
+      if (placeholderTs) {
+        await updateMessage(
+          channel,
+          placeholderTs,
+          `_(bridge error — check logs)_`,
+        );
+      } else {
+        await postReply(
+          channel,
+          inThread ? threadTs : null,
+          `_(bridge error — check logs)_`,
+        );
+      }
     } catch {}
+    if (reacted) {
+      try {
+        await removeReaction(channel, eventTs, "eyes");
+      } catch {}
+      try {
+        await addReaction(channel, eventTs, "warning");
+      } catch {}
+    }
   } finally {
     inFlight.delete(key);
   }
