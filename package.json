@@ -10,7 +10,8 @@
     "setup": "bash scripts/setup.sh",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "tunnel": "cloudflared tunnel --url http://localhost:3737"
+    "tunnel": "cloudflared tunnel --url http://localhost:3737",
+    "icons": "tsx scripts/generate-icons.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.132",
@@ -21,6 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "sharp": "^0.34.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
