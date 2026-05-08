@@ -34,6 +34,7 @@ import {
   sendPortalMessage,
 } from "./portal.js";
 import { bus } from "./events.js";
+import { getGitDiff, getGitStatus } from "./git.js";
 
 const PORT = Number(process.env.PORT || 3737);
 const BOT_USER_ID = process.env.SLACK_BOT_USER_ID || "";
@@ -275,6 +276,26 @@ app.post("/portal/reset", async (req, reply) => {
   const body = req.body as { parsed?: any };
   const id = String(body?.parsed?.id || "main");
   return await resetPortal(id);
+});
+
+// ---- Git status (read-only, phase 1) ----
+//
+// Reports on the cwd of the bridge process — the working directory it was
+// started from. Repo / worktree selection lands in a later phase; for now,
+// "where the server runs from" is "the active repo" and that's that.
+
+app.get("/git/status", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  return await getGitStatus(process.cwd());
+});
+
+app.get("/git/diff", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).send({ error: "unauthorized" });
+  }
+  return await getGitDiff(process.cwd());
 });
 
 // ---- SSE live stream ----

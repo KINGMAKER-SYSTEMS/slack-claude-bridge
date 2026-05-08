@@ -190,6 +190,86 @@ const APP_HTML = String.raw`<!DOCTYPE html>
     box-shadow: 0 0 12px rgba(167,139,250,0.6);
   }
   .brand .sub { color: var(--text-muted); font-weight: 400; font-size: 12px; }
+
+  /* Git pill in the header */
+  .git-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--bg-2);
+    font-size: 11px;
+    line-height: 1;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, border-color 0.15s;
+    max-width: 360px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .git-pill:hover { background: var(--bg-3); border-color: var(--line); }
+  .git-pill.loading { opacity: 0.5; }
+  .git-pill .gp-branch { color: var(--text); font-weight: 500; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; }
+  .git-pill .gp-sep { color: var(--text-dim); }
+  .git-pill .gp-dirty { color: var(--warn); }
+  .git-pill .gp-clean { color: var(--good); }
+  .git-pill .gp-ahead { color: var(--accent-2); }
+  .git-pill .gp-behind { color: var(--bad); }
+  .git-pill .gp-pr { color: var(--accent); }
+  .git-pill .gp-pr.draft { color: var(--text-muted); }
+  .git-pill .gp-pr.merged { color: var(--good); }
+  .git-pill .gp-pr.closed { color: var(--bad); }
+  @media (max-width: 720px) {
+    .git-pill { max-width: 180px; }
+    .git-pill .gp-repo { display: none; }
+  }
+  @media (max-width: 480px) {
+    .git-pill .gp-detail { display: none; }
+  }
+
+  /* Right-rail git section */
+  .git-rail-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 0; font-size: 12px;
+  }
+  .git-rail-row .lbl { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px; }
+  .git-rail-row .val { color: var(--text); font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; }
+  .git-commits {
+    display: flex; flex-direction: column; gap: 4px;
+    margin-top: 8px;
+  }
+  .git-commit {
+    display: flex; gap: 8px; padding: 6px 8px; border-radius: var(--radius-sm);
+    background: var(--bg-2); font-size: 11px; line-height: 1.4;
+  }
+  .git-commit .sha { color: var(--accent-2); font-family: "JetBrains Mono", ui-monospace, monospace; flex: none; }
+  .git-commit .subject { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .git-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .git-actions .btn { font-size: 11px; padding: 5px 10px; }
+  .git-diff {
+    margin-top: 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    max-height: 320px;
+    overflow: auto;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 10.5px;
+    line-height: 1.5;
+    white-space: pre;
+    color: var(--text-muted);
+  }
+  .git-diff .add { color: var(--good); }
+  .git-diff .del { color: var(--bad); }
+  .git-diff .hunk { color: var(--accent-2); }
+  .git-diff .file { color: var(--accent); }
+  .git-empty { color: var(--text-dim); font-style: italic; padding: 8px 0; font-size: 12px; }
+
   .topstats { display: flex; gap: 18px; align-items: center; }
   .ts-item { display: flex; align-items: baseline; gap: 6px; font-size: 12px; }
   .ts-item .num { font-weight: 600; font-size: 13px; }
@@ -839,6 +919,9 @@ const APP_HTML = String.raw`<!DOCTYPE html>
         <span>smaths-bot</span>
         <span class="sub">/ HQ</span>
       </div>
+      <button class="git-pill loading" id="git-pill" type="button" title="Active repo / branch">
+        <span class="gp-repo">…</span>
+      </button>
     </div>
     <div class="topbar-right">
       <div class="topstats">
@@ -901,6 +984,10 @@ const APP_HTML = String.raw`<!DOCTYPE html>
     <div class="rail-section">
       <h4>Today's stats</h4>
       <div class="stat-grid" id="stat-grid"></div>
+    </div>
+    <div class="rail-section" id="git-section">
+      <h4>Git</h4>
+      <div id="git-body"><div class="git-empty">Loading…</div></div>
     </div>
     <div class="rail-section" style="flex:1;">
       <h4>Live activity</h4>
@@ -1564,6 +1651,169 @@ function scheduleSidebarReload() {
     } catch {}
   }, 600);
 }
+
+// ---- Git status (read-only, phase 1) ----
+const gitPill = $("git-pill");
+const gitBody = $("git-body");
+let gitDiffOpen = false;
+let gitState = null;
+
+function renderGitPill(s) {
+  if (!gitPill) return;
+  if (!s || !s.ok) {
+    gitPill.classList.remove("loading");
+    gitPill.innerHTML = '<span class="gp-repo">' + escHtml(s && s.error ? s.error : "no git") + "</span>";
+    return;
+  }
+  gitPill.classList.remove("loading");
+  const dirtyTotal = (s.dirty.staged || 0) + (s.dirty.unstaged || 0) + (s.dirty.untracked || 0);
+  const dirtyHtml = dirtyTotal > 0
+    ? '<span class="gp-dirty">●' + dirtyTotal + "</span>"
+    : '<span class="gp-clean">●</span>';
+  const aheadHtml = s.ahead > 0 ? '<span class="gp-ahead">↑' + s.ahead + "</span>" : "";
+  const behindHtml = s.behind > 0 ? '<span class="gp-behind">↓' + s.behind + "</span>" : "";
+  let prHtml = "";
+  if (s.pr) {
+    const cls = s.pr.isDraft
+      ? "draft"
+      : s.pr.state === "MERGED"
+        ? "merged"
+        : s.pr.state === "CLOSED"
+          ? "closed"
+          : "";
+    prHtml = '<span class="gp-sep">·</span><span class="gp-pr ' + cls + '">PR#' + s.pr.number + "</span>";
+  }
+  const branchLabel = s.detached ? "DETACHED" : (s.branch || "?");
+  gitPill.innerHTML =
+    '<span class="gp-repo">' + escHtml(s.repo) + '</span>' +
+    '<span class="gp-sep">/</span>' +
+    '<span class="gp-branch">' + escHtml(branchLabel) + '</span>' +
+    '<span class="gp-detail">' +
+      (aheadHtml || behindHtml ? aheadHtml + behindHtml : "") +
+      dirtyHtml +
+    '</span>' +
+    prHtml;
+}
+
+function renderGitBody(s) {
+  if (!gitBody) return;
+  if (!s || !s.ok) {
+    gitBody.innerHTML = '<div class="git-empty">' + escHtml(s && s.error ? s.error : "not a git repo") + '</div>';
+    return;
+  }
+  const dirtyTotal = (s.dirty.staged || 0) + (s.dirty.unstaged || 0) + (s.dirty.untracked || 0);
+  const dirtyText = dirtyTotal === 0
+    ? '<span class="gp-clean">clean</span>'
+    : (s.dirty.staged + " staged · " + s.dirty.unstaged + " unstaged · " + s.dirty.untracked + " untracked");
+  let prRow = "";
+  if (s.pr) {
+    const stateLabel = s.pr.isDraft ? "draft" : s.pr.state.toLowerCase();
+    prRow =
+      '<div class="git-rail-row">' +
+        '<span class="lbl">PR</span>' +
+        '<span class="val"><a href="' + escHtml(s.pr.url) + '" target="_blank" rel="noopener">#' + s.pr.number + '</a> · ' + escHtml(stateLabel) +
+        (s.pr.mergeable === "CONFLICTING" ? ' · <span class="gp-behind">conflicts</span>' : "") +
+        '</span>' +
+      '</div>';
+  }
+  let html =
+    '<div class="git-rail-row"><span class="lbl">Repo</span><span class="val">' + escHtml(s.repo) + '</span></div>' +
+    '<div class="git-rail-row"><span class="lbl">Branch</span><span class="val">' + escHtml(s.detached ? "DETACHED" : (s.branch || "?")) + '</span></div>';
+  if (s.upstream) {
+    html += '<div class="git-rail-row"><span class="lbl">Upstream</span><span class="val">' + escHtml(s.upstream) + ' · ↑' + s.ahead + ' ↓' + s.behind + '</span></div>';
+  } else {
+    html += '<div class="git-rail-row"><span class="lbl">Upstream</span><span class="val">(none)</span></div>';
+  }
+  html += '<div class="git-rail-row"><span class="lbl">Dirty</span><span class="val">' + dirtyText + '</span></div>';
+  html += prRow;
+  html +=
+    '<div class="git-actions">' +
+      '<button class="btn" id="git-toggle-diff">' + (gitDiffOpen ? "Hide diff" : "Show diff & commits") + '</button>' +
+    '</div>';
+  if (gitDiffOpen) {
+    html += '<div id="git-diff-host" class="git-diff">Loading…</div>';
+  }
+  gitBody.innerHTML = html;
+  const tBtn = $("git-toggle-diff");
+  if (tBtn) tBtn.onclick = () => { gitDiffOpen = !gitDiffOpen; renderGitBody(gitState); if (gitDiffOpen) loadGitDiff(); };
+}
+
+function colorizeDiff(text) {
+  // Very small unified-diff colorizer. Operates line-by-line on already-escaped HTML.
+  const escaped = escHtml(text);
+  return escaped.split("\n").map((line) => {
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ")) {
+      return '<span class="file">' + line + '</span>';
+    }
+    if (line.startsWith("@@")) return '<span class="hunk">' + line + '</span>';
+    if (line.startsWith("+")) return '<span class="add">' + line + '</span>';
+    if (line.startsWith("-")) return '<span class="del">' + line + '</span>';
+    return line;
+  }).join("\n");
+}
+
+async function loadGitDiff() {
+  const host = $("git-diff-host");
+  if (!host) return;
+  try {
+    const res = await fetch("/git/diff" + tokParam);
+    if (!res.ok) {
+      host.textContent = "diff fetch failed (" + res.status + ")";
+      return;
+    }
+    const d = await res.json();
+    if (!d.ok) {
+      host.textContent = d.error || "no diff";
+      return;
+    }
+    const head = d.commitsAhead.length
+      ? '<div class="git-commits">' +
+          d.commitsAhead.map((c) =>
+            '<div class="git-commit"><span class="sha">' + escHtml(c.sha) + '</span><span class="subject">' + escHtml(c.subject) + '</span></div>'
+          ).join("") +
+        '</div>'
+      : "";
+    const body = d.diff
+      ? '<pre style="margin:0">' + colorizeDiff(d.diff) + '</pre>' +
+        (d.diffTruncated ? '<div class="git-empty">(diff truncated)</div>' : "")
+      : '<div class="git-empty">working tree clean</div>';
+    host.innerHTML = head + body;
+  } catch (e) {
+    host.textContent = "diff fetch failed";
+  }
+}
+
+async function loadGitStatus() {
+  try {
+    const res = await fetch("/git/status" + tokParam);
+    if (!res.ok) {
+      gitState = { ok: false, error: "auth" };
+    } else {
+      gitState = await res.json();
+    }
+  } catch {
+    gitState = { ok: false, error: "offline" };
+  }
+  renderGitPill(gitState);
+  renderGitBody(gitState);
+}
+
+if (gitPill) {
+  gitPill.onclick = () => {
+    // On mobile, open the right rail; on desktop, just refresh
+    const aside = document.querySelector("aside.right");
+    if (aside && aside.classList && window.matchMedia("(max-width: 880px)").matches) {
+      // Re-use the existing right-toggle behavior
+      const rt = $("right-toggle");
+      if (rt) rt.click();
+    }
+    loadGitStatus();
+    if (gitDiffOpen) loadGitDiff();
+  };
+}
+
+loadGitStatus();
+setInterval(loadGitStatus, 15000);
 
 // ---- Boot ----
 loadAll().then(() => {
