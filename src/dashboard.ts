@@ -80,7 +80,13 @@ export async function getDashboardData() {
 }
 
 export function renderAppHtml(token: string): string {
-  return APP_HTML.replace("__TOKEN__", JSON.stringify(token));
+  const manifestHref = token
+    ? `/manifest.webmanifest?token=${encodeURIComponent(token)}`
+    : "/manifest.webmanifest";
+  return APP_HTML.replace("__TOKEN__", JSON.stringify(token)).replace(
+    "__MANIFEST_HREF__",
+    manifestHref,
+  );
 }
 
 const APP_HTML = String.raw`<!DOCTYPE html>
@@ -88,7 +94,13 @@ const APP_HTML = String.raw`<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>smaths-bot HQ</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#a78bfa">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SmathsBot">
+<link rel="manifest" href="__MANIFEST_HREF__">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -913,6 +925,12 @@ const APP_HTML = String.raw`<!DOCTYPE html>
 const TOKEN = __TOKEN__;
 const tokParam = TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "";
 const tokAmp = TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "";
+
+// PWA service worker — Chrome/Android only. iOS Safari ignores it for
+// install but registering is harmless.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 
 const $ = (id) => document.getElementById(id);
 const conv = $("convo-list");

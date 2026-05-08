@@ -1,4 +1,7 @@
 import "dotenv/config";
+import { createReadStream } from "node:fs";
+import { stat as fsStat } from "node:fs/promises";
+import { resolve as pathResolve, normalize as pathNormalize } from "node:path";
 import Fastify from "fastify";
 import { verifySlackSignature } from "./verify.js";
 import {
@@ -69,6 +72,90 @@ function checkDashboardAuth(req: any): boolean {
     (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
   return provided === DASHBOARD_TOKEN;
 }
+
+// ---- PWA assets ----
+//
+// iOS Safari treats the dashboard as installable to Home Screen given a
+// manifest + apple-touch-icon. start_url has to carry the dashboard token
+// so the standalone app loads authenticated; if the token is rotated, the
+// home-screen icon will need to be re-added.
+
+const ICONS_DIR = pathResolve("./public/icons");
+
+app.get("/manifest.webmanifest", async (req, reply) => {
+  if (!checkDashboardAuth(req)) {
+    return reply.code(401).type("text/plain").send("unauthorized");
+  }
+  const token = ((req.query as any)?.token as string) || DASHBOARD_TOKEN || "";
+  const startQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+  const manifest = {
+    name: "Smaths Bot",
+    short_name: "SmathsBot",
+    description: "smaths-bot HQ — Slack-Claude bridge dashboard + portal.",
+    start_url: `/app${startQuery}`,
+    scope: "/",
+    display: "standalone",
+    orientation: "portrait",
+    theme_color: "#a78bfa",
+    background_color: "#0a0a0c",
+    icons: [
+      { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+      { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+      {
+        src: "/icons/icon-512-maskable.png",
+        sizes: "512x512",
+        type: "image/png",
+        purpose: "maskable",
+      },
+    ],
+  };
+  reply
+    .type("application/manifest+json")
+    .header("cache-control", "no-cache")
+    .send(manifest);
+});
+
+// Icons are public assets — no auth gate. iOS Safari can't pass the token
+// when fetching apple-touch-icon, and PWA manifest icons are conventionally
+// open. There's nothing sensitive in the PNGs themselves.
+app.get("/icons/:file", async (req, reply) => {
+  const file = (req.params as any).file as string;
+  // Reject anything that isn't a plain PNG filename — defense against
+  // path traversal even though we resolve+containment-check below.
+  if (!/^[a-zA-Z0-9._-]+\.png$/.test(file)) {
+    return reply.code(404).send("not found");
+  }
+  const full = pathNormalize(pathResolve(ICONS_DIR, file));
+  if (!full.startsWith(ICONS_DIR + "/") && full !== ICONS_DIR) {
+    return reply.code(404).send("not found");
+  }
+  try {
+    await fsStat(full);
+  } catch {
+    return reply.code(404).send("not found");
+  }
+  reply
+    .type("image/png")
+    .header("cache-control", "public, max-age=86400")
+    .send(createReadStream(full));
+});
+
+// Tiny network-passthrough service worker. Doesn't cache anything — the
+// dashboard reads streaming SSE and a frequently-updating dataset, so a
+// stale-while-revalidate strategy would do more harm than good. iOS doesn't
+// require this for install; it's here so Chrome Android (and Lighthouse)
+// stop complaining and the page is technically a "real" PWA.
+app.get("/sw.js", async (_req, reply) => {
+  const sw = `// smaths-bot HQ service worker — passthrough only.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", () => {});
+`;
+  reply
+    .type("application/javascript")
+    .header("cache-control", "no-cache")
+    .send(sw);
+});
 
 // ---- App shell ----
 
