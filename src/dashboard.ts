@@ -728,33 +728,120 @@ const APP_HTML = String.raw`<!DOCTYPE html>
   .modal input:focus { border-color: var(--accent); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
-  /* Mobile */
-  @media (max-width: 1100px) {
-    aside.right { display: none; }
-    #app { grid-template-columns: 260px 1fr; }
+  /* Hamburger buttons (mobile only) */
+  .hamburger {
+    display: none;
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--text-muted);
+    width: 36px; height: 36px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex-shrink: 0;
   }
+  .hamburger:active { background: var(--bg-hover); }
+  .hamburger svg { width: 18px; height: 18px; }
+  .topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .topbar-right { display: flex; align-items: center; gap: 12px; }
+  .drawer-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(2px);
+    z-index: 8;
+  }
+  .drawer-backdrop.open { display: block; }
+
+  /* Tablet — collapse right rail into drawer */
+  @media (max-width: 1100px) {
+    #app { grid-template-columns: 280px 1fr; }
+    aside.right {
+      position: fixed;
+      top: 56px;
+      right: 0;
+      bottom: 0;
+      width: min(360px, 88vw);
+      z-index: 9;
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      box-shadow: var(--shadow-lg);
+      border-left: 1px solid var(--line-soft);
+    }
+    aside.right.open { transform: translateX(0); }
+    .hamburger.right-toggle { display: inline-flex; }
+  }
+
+  /* Phone — both sidebars become drawers */
   @media (max-width: 720px) {
-    aside.sidebar { display: none; }
     #app { grid-template-columns: 1fr; }
+    .topstats .ts-item { display: none; }
+    .topstats .ts-item:first-child,
+    .topstats .conn { display: flex; }
+    aside.sidebar {
+      position: fixed;
+      top: 56px;
+      left: 0;
+      bottom: 0;
+      width: min(300px, 84vw);
+      z-index: 9;
+      transform: translateX(-100%);
+      transition: transform 0.22s ease;
+      box-shadow: var(--shadow-lg);
+      border-right: 1px solid var(--line-soft);
+    }
+    aside.sidebar.open { transform: translateX(0); }
+    .hamburger.left-toggle { display: inline-flex; }
+    .pane-head { padding: 12px 16px; }
+    .chat-scroll { padding: 16px 14px 18px; }
+    .composer-inner { padding: 10px 12px 12px; }
+    .composer-shell textarea {
+      font-size: 16px;  /* prevent iOS zoom on focus */
+    }
+    .composer-actions { flex-wrap: wrap; gap: 8px; }
+    .composer-hint { font-size: 10px; }
+    .pane-head h2 { font-size: 14px; }
+    .nav-item { padding: 12px 12px; }  /* larger tap target */
+    .nav-item .title { font-size: 14px; }
+  }
+
+  /* Very small phones */
+  @media (max-width: 380px) {
+    .brand .sub { display: none; }
+    .composer-hint { display: none; }
   }
 </style>
 </head>
 <body>
 <div id="app">
   <header class="topbar">
-    <div class="brand">
-      <span class="dot"></span>
-      <span>smaths-bot</span>
-      <span class="sub">/ HQ</span>
+    <div class="topbar-left">
+      <button class="hamburger left-toggle" id="left-toggle" aria-label="Open navigation">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="6" x2="17" y2="6"/><line x1="3" y1="10" x2="17" y2="10"/><line x1="3" y1="14" x2="17" y2="14"/></svg>
+      </button>
+      <div class="brand">
+        <span class="dot"></span>
+        <span>smaths-bot</span>
+        <span class="sub">/ HQ</span>
+      </div>
     </div>
-    <div class="topstats">
-      <div class="ts-item"><span class="num" id="st-contexts">0</span><span class="lbl">threads</span></div>
-      <div class="ts-item"><span class="num" id="st-replies">0</span><span class="lbl">replies</span></div>
-      <div class="ts-item"><span class="num" id="st-portal">0</span><span class="lbl">portal</span></div>
-      <div class="ts-item"><span class="num" id="st-errors">0</span><span class="lbl">errors</span></div>
-      <div class="conn" id="conn"><span class="pulse"></span><span id="conn-text">connecting…</span></div>
+    <div class="topbar-right">
+      <div class="topstats">
+        <div class="ts-item"><span class="num" id="st-contexts">0</span><span class="lbl">threads</span></div>
+        <div class="ts-item"><span class="num" id="st-replies">0</span><span class="lbl">replies</span></div>
+        <div class="ts-item"><span class="num" id="st-portal">0</span><span class="lbl">portal</span></div>
+        <div class="ts-item"><span class="num" id="st-errors">0</span><span class="lbl">errors</span></div>
+        <div class="conn" id="conn"><span class="pulse"></span><span id="conn-text">connecting…</span></div>
+      </div>
+      <button class="hamburger right-toggle" id="right-toggle" aria-label="Open activity feed">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10" cy="4" r="1.5"/><circle cx="10" cy="10" r="1.5"/><circle cx="10" cy="16" r="1.5"/></svg>
+      </button>
     </div>
   </header>
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
 
   <aside class="sidebar">
     <div class="side-section">
@@ -842,6 +929,40 @@ const paneSub = $("pane-sub");
 const paneActions = $("pane-actions");
 const conn = $("conn");
 const connText = $("conn-text");
+const sidebarEl = document.querySelector("aside.sidebar");
+const rightRailEl = document.querySelector("aside.right");
+const drawerBackdrop = $("drawer-backdrop");
+const leftToggleBtn = $("left-toggle");
+const rightToggleBtn = $("right-toggle");
+
+function closeDrawers() {
+  sidebarEl?.classList.remove("open");
+  rightRailEl?.classList.remove("open");
+  drawerBackdrop?.classList.remove("open");
+}
+function openDrawer(which) {
+  closeDrawers();
+  if (which === "left") sidebarEl?.classList.add("open");
+  if (which === "right") rightRailEl?.classList.add("open");
+  drawerBackdrop?.classList.add("open");
+}
+leftToggleBtn?.addEventListener("click", () => {
+  if (sidebarEl?.classList.contains("open")) closeDrawers();
+  else openDrawer("left");
+});
+rightToggleBtn?.addEventListener("click", () => {
+  if (rightRailEl?.classList.contains("open")) closeDrawers();
+  else openDrawer("right");
+});
+drawerBackdrop?.addEventListener("click", closeDrawers);
+// Close drawers when picking a conversation/thread on mobile
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (!(t instanceof Element)) return;
+  if (t.closest(".nav-item") && window.matchMedia("(max-width: 720px)").matches) {
+    closeDrawers();
+  }
+});
 
 const state = {
   view: "empty", // 'empty' | 'portal' | 'thread'
