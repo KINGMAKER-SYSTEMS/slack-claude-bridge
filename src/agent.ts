@@ -41,6 +41,19 @@ Tools available:
 - slack_post_message: post a message to a channel or thread (always requires operator confirmation first)
 `;
 
+const SLACK_PROMPT_SUFFIX = `
+
+You are responding directly inside Slack as the bot. The user's message you're replying to was a mention of you in a channel or thread. The text you produce in this turn IS the reply that will be posted — there is no operator review step, no confirmation gate.
+
+Slack reply behavior:
+- Output the reply body only. No preamble ("here's the reply"), no meta-commentary, no narration of tool calls. Plain Slack markdown.
+- Do not wait for "yes / send / go". There is no operator on the other side of this turn — this is a direct auto-reply.
+- Use your tools (filesystem, git, web, etc.) freely if they help you answer. Don't post additional Slack messages — your final text in this turn is the message that gets posted.
+- Be direct and grounded in real data. Match the operator's voice from the system prompt above.
+`;
+
+const SQUASH_PROMPT = `You summarize prior Slack conversation context. Output only the requested summary text — no preamble, no meta-commentary, no tool use. Just the summary.`;
+
 function buildSlackTools() {
   const slackReadChannel = tool(
     "slack_read_channel",
@@ -225,12 +238,22 @@ async function listBotChannels() {
   return result;
 }
 
+export type AgentTurnMode = "portal" | "slack" | "squash";
+
 export type AgentTurnInput = {
   prompt: string;
   resumeSessionId?: string | null;
   abortSignal?: AbortSignal;
-  /** One-shot situational brief injected into the system prompt for fresh sessions. */
+  /** One-shot situational brief injected into the system prompt for fresh sessions (portal only). */
   landingBrief?: string;
+  /**
+   * Which call site is invoking the turn. Controls system prompt framing and
+   * whether Slack tools / landing brief are wired in.
+   * - "portal" (default): operator-steering web chat. Slack tools available, must confirm before posting.
+   * - "slack": bot is auto-replying to a Slack mention. Output text is the reply itself.
+   * - "squash": pure summarization of prior conversation. No Slack tools, no landing brief, minimal framing.
+   */
+  mode?: AgentTurnMode;
   onAssistantText?: (chunk: string) => void;
   onToolUse?: (info: { name: string; input: any }) => void;
   onToolResult?: (info: { name: string; isError?: boolean }) => void;
@@ -245,13 +268,26 @@ export type AgentTurnResult = {
 
 const BASE_SYSTEM_PROMPT = loadSystemPrompt();
 
-function buildSystemPrompt(opts?: { landingBrief?: string }): string {
+function buildSystemPrompt(opts?: {
+  mode?: AgentTurnMode;
+  landingBrief?: string;
+}): string {
+  const mode = opts?.mode ?? "portal";
+
+  if (mode === "squash") {
+    return SQUASH_PROMPT;
+  }
+
+  const suffix = mode === "slack" ? SLACK_PROMPT_SUFFIX : PORTAL_PROMPT_SUFFIX;
   const liveTools = ALLOWED_TOOLS.map((t) => `- ${t}`).join("\n");
   const liveSection = `\n\nLive tools available this session (authoritative — trust this list, not memory):\n${liveTools}`;
-  const landing = opts?.landingBrief
-    ? `\n\nSession landing brief (current state at session start):\n${opts.landingBrief}`
-    : "";
-  return BASE_SYSTEM_PROMPT + PORTAL_PROMPT_SUFFIX + liveSection + landing;
+  // Landing brief is portal-only — Slack auto-replies don't need it (each reply
+  // already gets the running summary + recent thread messages from context.ts).
+  const landing =
+    mode === "portal" && opts?.landingBrief
+      ? `\n\nSession landing brief (current state at session start):\n${opts.landingBrief}`
+      : "";
+  return BASE_SYSTEM_PROMPT + suffix + liveSection + landing;
 }
 
 const slackMcp = createSdkMcpServer({
@@ -281,14 +317,24 @@ export async function runAgentTurn(
   let totalTokens: number | undefined;
   let isError = false;
 
+  const mode: AgentTurnMode = input.mode ?? "portal";
+  // Squash is pure summarization — don't wire in Slack tools, don't allow any
+  // tool use at all. Forces the model to just produce the summary text.
+  const isSquash = mode === "squash";
+
   const queryResult = query({
     prompt: input.prompt,
     options: {
       cwd: process.cwd(),
-      systemPrompt: buildSystemPrompt({ landingBrief: input.landingBrief }),
-      mcpServers: { slack: slackMcp },
-      allowedTools: ALLOWED_TOOLS,
-      tools: ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch"],
+      systemPrompt: buildSystemPrompt({
+        mode,
+        landingBrief: input.landingBrief,
+      }),
+      mcpServers: isSquash ? {} : { slack: slackMcp },
+      allowedTools: isSquash ? [] : ALLOWED_TOOLS,
+      tools: isSquash
+        ? []
+        : ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch"],
       resume: input.resumeSessionId ?? undefined,
       abortController: input.abortSignal
         ? wrapSignal(input.abortSignal)

@@ -1,20 +1,22 @@
 # slack-claude-bridge
 
-A local webhook server that turns @-mentions in Slack into headless [Claude Code](https://docs.claude.com/en/docs/claude-code) sessions on your laptop. Tag the bot in a Slack channel → `claude -p` spins up with full tool access (filesystem, git, gh, MCP servers) → the reply gets posted back as the bot.
+A local webhook server that turns @-mentions in Slack into [Claude Code](https://docs.claude.com/en/docs/claude-code) sessions on your laptop. Tag the bot in a Slack channel → the bridge invokes the Claude Agent SDK in-process with full tool access (filesystem, git, gh, MCP servers) → the reply gets posted back as the bot.
 
-Subsequent mentions in the same thread resume the same Claude session, so the conversation has memory.
+Subsequent mentions in the same thread carry forward via a per-thread running summary, so the conversation has memory without exploding token usage.
 
 ```
 Slack mention
    ↓
 Slack Events API (HTTPS)
    ↓
-Cloudflare Tunnel  ──→  localhost:3737  (this server)
+Cloudflare Tunnel  ──→  localhost:3737  (this Node server)
                               ↓
-                        spawn `claude -p --resume <session>`
+                        Claude Agent SDK (in-process)
                               ↓
                         post reply via Slack Web API
 ```
+
+> **Note on the architecture migration.** Earlier versions shelled out to the `claude -p` CLI as a subprocess. That path is broken in Claude Code 2.0.56 (returns `error_during_execution` with empty output before the API call fires), so the bridge now uses the in-process Agent SDK (`@anthropic-ai/claude-agent-sdk`) for all model calls — Slack auto-replies, Portal chat, and context squashing.
 
 ## What you get
 
@@ -57,7 +59,10 @@ Most of it is fill-in-the-blank. The two manual pieces are creating the Slack ap
 ```
 src/
   server.ts                 Fastify webhook, signature verify, dispatch
-  spawn.ts                  `claude -p` runner, parses stream-json, extracts session_id
+  agent.ts                  Agent SDK runner — single `runAgentTurn` shared by all call sites
+  spawn.ts                  Slack auto-reply path — calls runAgentTurn with mode:"slack"
+  context.ts                Per-thread running summary + squash (mode:"squash")
+  portal.ts                 /portal web chat for the operator (mode:"portal")
   slack.ts                  Slack Web API client (postReply, fetchThread, fetchChannel)
   sessions.ts               thread_ts ↔ session_id map, persisted at data/sessions.json
   verify.ts                 HMAC SHA256 signature check
@@ -191,17 +196,17 @@ The system prompt that Claude runs with lives in `prompts/system.md` (gitignored
 
 Override the path with `SYSTEM_PROMPT_FILE=/some/other/path.md` in `.env` if you want.
 
-## How thread sessions work
+## How thread context works
 
-When a mention arrives:
+Each thread/channel gets a per-key running summary instead of relying on Claude session resumption. When a mention arrives:
 
-1. `threadKey = channel:thread_ts`
-2. Look up `data/sessions.json` for an existing Claude `session_id` for that key.
-3. Spawn `claude -p` with `--resume <session_id>` if found, else fresh.
-4. Stream JSON output, capture the new `session_id` from the first event.
-5. Save `{key: {sessionId, updatedAt}}` back to `sessions.json`.
+1. `key = channel:thread_ts` (or `channel:_root` for top-level mentions).
+2. Load `data/contexts/<key>.json` — this holds a running summary of older history plus a watermark `summarizedThrough` ts.
+3. Pull the latest Slack messages (thread or channel, see below) and select the recent window since the watermark.
+4. Build a prompt = running summary + recent messages + the latest mention. Hand it to the Agent SDK fresh.
+5. Post the reply, increment `msgsSinceSquash`. When it crosses `CONTEXT_SQUASH_THRESHOLD`, fold the older messages into the summary (a separate "squash" Agent SDK call).
 
-This means if a teammate mentions the bot in a thread on Tuesday, then someone else pings it Wednesday, Claude resumes with full thread memory.
+This keeps token usage bounded as threads grow long while preserving the names, decisions, and open questions the bot needs to stay coherent across days.
 
 ### Channel context vs thread context
 
@@ -209,6 +214,18 @@ This means if a teammate mentions the bot in a thread on Tuesday, then someone e
 - **Mentioned inside an existing thread**: the bridge calls `conversations.replies` and uses just the thread.
 
 This way the bot knows what's going on in a busy channel without you having to manually summarize it.
+
+## Execution modes
+
+All three call sites go through the same `runAgentTurn` in `src/agent.ts`, distinguished by a `mode` field that controls how the system prompt is framed:
+
+| Mode | Caller | What it does |
+|---|---|---|
+| `portal` | `src/portal.ts` (`/portal` web chat) | Operator is steering. Slack tools wired in. Model must confirm before posting to Slack — never posts unprompted. Includes the optional landing brief. |
+| `slack` | `src/spawn.ts` (Slack mention path) | Model is auto-replying to a Slack mention as the bot. Output text **is** the reply that gets posted. No confirmation gate, no Portal framing. |
+| `squash` | `src/context.ts` (running-summary squasher) | Pure summarization. No Slack tools, no landing brief, minimal system prompt. Returns only the summary text. |
+
+Adding a new call site? Pick a mode (or add one to `AgentTurnMode` in `src/agent.ts`) and pass it to `runAgentTurn` — the system prompt and tool surface adjust automatically.
 
 ## Security model
 
@@ -275,7 +292,7 @@ The shared parts of the SOP — skills files, conduct docs, agent playbooks — 
 
 ## Known issues / TODO
 
-- [ ] If `claude -p` hangs (rare, but happens), the in-flight guard never clears. Add a hard timeout (10 min default).
+- [ ] If a model call hangs, the in-flight guard never clears. Add a hard timeout (10 min default).
 - [ ] No streaming partial replies to Slack. Could `chat.update` an initial "thinking…" message as text accumulates.
 - [ ] `fetchThread`/`fetchChannel` are capped at 50/100 messages — long threads/channels get truncated.
 - [ ] Bot will respond to `message_changed` events if structured as edit-with-mention. Currently filtered by checking subtype.

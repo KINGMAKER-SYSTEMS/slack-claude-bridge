@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { runAgentTurn } from "./agent.js";
 
 const CONTEXTS_DIR = process.env.CONTEXTS_DIR || "./data/contexts";
 const WINDOW_SIZE = Number(process.env.CONTEXT_WINDOW_SIZE || 10);
@@ -146,60 +146,20 @@ Produce an updated summary, max 500 tokens, preserving:
 
 Drop pleasantries, off-topic asides, redundant restatements. Replace the prior summary entirely — do not append. Output the new summary text only.`;
 
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(
-      "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", prompt],
-      { stdio: ["ignore", "pipe", "pipe"], env: process.env },
-    );
-    let buf = "";
-    let stderr = "";
-    let result = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      buf += chunk.toString("utf8");
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const evt = JSON.parse(line);
-          if (evt.type === "assistant" && evt.message?.content) {
-            for (const block of evt.message.content) {
-              if (block.type === "text" && block.text) {
-                result += block.text;
-              }
-            }
-          }
-          if (evt.type === "result" && evt.result) {
-            result = evt.result;
-          }
-        } catch {
-          // skip
-        }
-      }
-    });
-    child.stderr.on("data", (c: Buffer) => {
-      stderr += c.toString("utf8");
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0 && !result) {
-        reject(new Error(`squash claude exited ${code}: ${stderr.slice(0, 300)}`));
-        return;
-      }
-      const trimmed = result.trim();
-      if (!trimmed) {
-        // Claude exited cleanly but produced no summary text. Surface this
-        // as an error so the caller can log it properly instead of silently
-        // overwriting a real prior summary with an empty string.
-        reject(
-          new Error(
-            `squash produced empty summary (code=${code}, stderr=${stderr.slice(0, 200)})`,
-          ),
-        );
-        return;
-      }
-      resolve(trimmed);
-    });
+  // Goes through the Agent SDK with mode:"squash" — pure summarization,
+  // no Slack tools, no Portal framing, no landing brief. The standalone
+  // `claude -p` CLI is broken in 2.0.56 (returns error_during_execution
+  // with empty output before the API call fires).
+  const result = await runAgentTurn({
+    prompt,
+    resumeSessionId: null,
+    mode: "squash",
   });
+  const trimmed = result.text.trim();
+  if (!trimmed) {
+    throw new Error(
+      `squash produced empty summary (isError=${result.isError})`,
+    );
+  }
+  return trimmed;
 }
