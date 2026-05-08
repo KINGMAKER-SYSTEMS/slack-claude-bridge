@@ -7,3 +7,6 @@ data/
 cloudflared.yml
 .claude/settings.local.json
 prompts/system.md
+
+.claude/
+*.plugin
