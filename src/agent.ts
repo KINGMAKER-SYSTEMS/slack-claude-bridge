@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import type { McpStdioServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -296,6 +297,104 @@ const slackMcp = createSdkMcpServer({
   tools: buildSlackTools(),
 });
 
+// ---- External MCP servers (Linear, Notion) ----
+//
+// Wired in via stdio. Each server is conditional on its auth env var being
+// present in .env — missing env var => server skipped at boot with a warning,
+// not a 5s connect-timeout on every Slack mention.
+//
+// Package-name choices documented here so they can be swapped without
+// re-deriving:
+// - Linear: `@tacticlaunch/mcp-linear` — community npm package that accepts
+//   a Linear personal API key (`LINEAR_API_KEY`, prefix `lin_api_...`).
+//   Alternates if this one misbehaves:
+//     * `mcp-remote https://mcp.linear.app/sse` — Linear's official remote
+//       MCP, OAuth-only, requires an interactive auth handshake on first run
+//       (not headless-friendly for a daemon like smaths-bot).
+//     * Any other community linear-mcp on npm that accepts an API key.
+// - Notion: `@notionhq/notion-mcp-server` — Notion's official package. Auth
+//   contract is `OPENAPI_MCP_HEADERS` (a JSON-stringified blob of HTTP
+//   headers). `NOTION_TOKEN` is set as a secondary env var for forward-compat
+//   with any future release that reads the token directly.
+//
+// Tool-name enumeration mirrors what each server emits at connect time. If
+// the upstream package adds/removes tools, this list needs to follow — the
+// SDK gates calls on exact names, so an unlisted tool from the server simply
+// won't be callable by the model.
+
+type ExternalMcpName = "linear" | "notion";
+
+const EXTERNAL_MCP_TOOL_NAMES: Record<ExternalMcpName, readonly string[]> = {
+  linear: [
+    "mcp__linear__list_issues",
+    "mcp__linear__get_issue",
+    "mcp__linear__save_issue",
+    "mcp__linear__save_comment",
+    "mcp__linear__list_comments",
+    "mcp__linear__list_teams",
+    "mcp__linear__list_projects",
+    "mcp__linear__list_users",
+    "mcp__linear__list_issue_labels",
+    "mcp__linear__list_issue_statuses",
+  ],
+  notion: [
+    "mcp__notion__notion-search",
+    "mcp__notion__notion-fetch",
+    "mcp__notion__notion-create-pages",
+    "mcp__notion__notion-update-page",
+    "mcp__notion__notion-get-users",
+    "mcp__notion__notion-get-teams",
+    "mcp__notion__notion-create-comment",
+    "mcp__notion__notion-get-comments",
+  ],
+};
+
+function buildExternalMcpServers(): {
+  servers: Record<string, McpStdioServerConfig>;
+  enabled: ExternalMcpName[];
+} {
+  const servers: Record<string, McpStdioServerConfig> = {};
+  const enabled: ExternalMcpName[] = [];
+
+  const linearKey = process.env.LINEAR_API_KEY;
+  if (linearKey) {
+    servers.linear = {
+      command: "npx",
+      args: ["-y", "@tacticlaunch/mcp-linear"],
+      env: { LINEAR_API_KEY: linearKey },
+    };
+    enabled.push("linear");
+  } else {
+    console.warn(
+      "[smaths-bot] LINEAR_API_KEY missing — Linear MCP disabled. Add it to .env and restart to enable.",
+    );
+  }
+
+  const notionToken = process.env.NOTION_TOKEN;
+  if (notionToken) {
+    servers.notion = {
+      command: "npx",
+      args: ["-y", "@notionhq/notion-mcp-server"],
+      env: {
+        OPENAPI_MCP_HEADERS: JSON.stringify({
+          Authorization: `Bearer ${notionToken}`,
+          "Notion-Version": "2022-06-28",
+        }),
+        NOTION_TOKEN: notionToken,
+      },
+    };
+    enabled.push("notion");
+  } else {
+    console.warn(
+      "[smaths-bot] NOTION_TOKEN missing — Notion MCP disabled. Add it to .env and restart to enable.",
+    );
+  }
+
+  return { servers, enabled };
+}
+
+const externalMcp = buildExternalMcpServers();
+
 const ALLOWED_TOOLS = [
   "mcp__slack__slack_read_channel",
   "mcp__slack__slack_read_thread",
@@ -307,6 +406,11 @@ const ALLOWED_TOOLS = [
   "Grep",
   "WebFetch",
   "WebSearch",
+  // External MCP tools — only included if the corresponding server is
+  // enabled (i.e. its auth env var is set). When disabled, the names are
+  // omitted from both the allowlist and the system-prompt "live tools"
+  // section, so the model doesn't pitch tools it can't actually call.
+  ...externalMcp.enabled.flatMap((name) => EXTERNAL_MCP_TOOL_NAMES[name]),
 ];
 
 export async function runAgentTurn(
@@ -330,7 +434,7 @@ export async function runAgentTurn(
         mode,
         landingBrief: input.landingBrief,
       }),
-      mcpServers: isSquash ? {} : { slack: slackMcp },
+      mcpServers: isSquash ? {} : { slack: slackMcp, ...externalMcp.servers },
       allowedTools: isSquash ? [] : ALLOWED_TOOLS,
       tools: isSquash
         ? []

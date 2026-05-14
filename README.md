@@ -93,6 +93,15 @@ scripts/
    - **Bot User OAuth Token** (`xoxb-...`) — OAuth & Permissions
    - **Bot User ID** — `curl -s "https://slack.com/api/auth.test" -H "Authorization: Bearer xoxb-..."` and grab `user_id`
 
+#### Optional: external MCP tokens
+
+Two env vars enable the Linear and Notion MCP servers. Both are optional — the bridge boots fine without them, just doesn't expose those tools. When either env var is missing, the bridge logs a warning at startup and the corresponding `mcp__linear__*` / `mcp__notion__*` tools are omitted from the bot's tool surface.
+
+- `LINEAR_API_KEY` — Linear personal API key from linear.app → Settings → Account → API. Format `lin_api_...`. Wires in [`@tacticlaunch/mcp-linear`](https://www.npmjs.com/package/@tacticlaunch/mcp-linear) for ticket read/write.
+- `NOTION_TOKEN` — Notion internal integration token from notion.so/my-integrations. Format `secret_...` or `ntn_...`. Wires in [`@notionhq/notion-mcp-server`](https://www.npmjs.com/package/@notionhq/notion-mcp-server) for Notion search/read/write. The integration must be explicitly shared with each Notion page it should access (Notion's permission model is per-page).
+
+Restart the bridge after adding either: `lsof -ti:3737 | xargs kill -9` (launchd respawns within ~1s; in dev mode follow with `pnpm dev`).
+
 ### 2. Cloudflare tunnel (persistent public URL)
 
 You need a stable hostname so Slack's webhook config doesn't break every reboot. The throwaway `pnpm tunnel` script is fine for testing but generates a new URL each run.
